@@ -1,0 +1,938 @@
+openapi: 3.1.0
+info:
+  title: Thrift Platform API (working title)
+  version: 0.1.0
+  description: |
+    A reuse-first thrifting marketplace. Sellers list pre-owned items, buyers reserve
+    them and receive pickup details. Every completed exchange is credited with
+    estimated CO2e and water avoided versus buying the item new.
+
+    Hackathon track fit: Waste and Energy (reuse, recycling, informal recyclers),
+    with measurable Heat and Water impact (water saved per item).
+
+    ## Local-first, AWS-ready
+    Every external dependency sits behind this contract, so the local stand-in can be
+    swapped for the AWS service without changing any endpoint.
+
+    | Concern          | Local (hackathon)              | AWS (later)                    |
+    |------------------|--------------------------------|--------------------------------|
+    | Image storage    | MinIO / local disk (S3 API)    | S3 (presigned PUT)             |
+    | Database         | SQLite / DynamoDB Local        | DynamoDB or RDS                |
+    | Auth             | Self-issued JWT                | Cognito                        |
+    | Notifications    | Console log / in-app           | SES + SNS                      |
+    | API runtime      | Local server                   | API Gateway + Lambda           |
+
+    ## Conventions
+    - JSON everywhere; timestamps are ISO 8601 UTC; IDs are opaque strings (ULID).
+    - Auth: `Authorization: Bearer <jwt>`. One account can be both buyer and seller.
+    - Pagination: cursor-based (`limit`, `cursor`) returning `nextCursor`.
+    - `POST /orders` requires an `Idempotency-Key` header.
+    - **Payment gate:** the exact address, contact phone and pickup code are returned only
+      after `paymentStatus` is `paid` (UPI confirmed by the payment provider). Before that,
+      buyers see only the seller's display name, area and rating.
+    - Errors use one shape (`Error`).
+    - Impact numbers are estimates from per-category factors (see `/categories`);
+      cite your sources for the factors in the demo.
+servers:
+  - url: http://localhost:8080/v1
+    description: Local development
+  - url: https://api.example.com/v1
+    description: Future AWS deployment (API Gateway)
+tags:
+  - name: Auth
+  - name: Users
+  - name: Categories
+  - name: Listings
+  - name: Uploads
+  - name: Orders
+  - name: Pickup
+  - name: Impact
+  - name: Reviews
+  - name: System
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Liveness check
+      security: []
+      responses:
+        '200':
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  storage: { type: string, enum: [local, s3] }
+
+  # ---------------- Auth ----------------
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Create an account
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Logged in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------- Users ----------------
+  /users/me:
+    get:
+      tags: [Users]
+      summary: Get my profile
+      responses:
+        '200':
+          description: My profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Users]
+      summary: Update my profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserUpdate' }
+      responses:
+        '200':
+          description: Updated profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /users/{userId}:
+    get:
+      tags: [Users]
+      summary: Get a public seller/buyer profile
+      description: Public fields only (name, area, rating, impact totals). No contact or address.
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: Public profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicUser' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- Categories ----------------
+  /categories:
+    get:
+      tags: [Categories]
+      summary: List categories with impact factors
+      security: []
+      responses:
+        '200':
+          description: Categories
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Category' }
+
+  # ---------------- Listings ----------------
+  /listings:
+    get:
+      tags: [Listings]
+      summary: Search and browse active listings
+      security: []
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: Free-text search }
+        - { name: categoryId, in: query, schema: { type: string } }
+        - { name: condition, in: query, schema: { $ref: '#/components/schemas/Condition' } }
+        - { name: minPrice, in: query, schema: { type: number, minimum: 0 } }
+        - { name: maxPrice, in: query, schema: { type: number, minimum: 0 } }
+        - { name: city, in: query, schema: { type: string } }
+        - { name: lat, in: query, schema: { type: number } }
+        - { name: lng, in: query, schema: { type: number } }
+        - { name: radiusKm, in: query, schema: { type: number, default: 10 } }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [newest, price_asc, price_desc, nearest, impact_desc], default: newest }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of listings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ListingSummary' }
+                  nextCursor: { type: [string, 'null'] }
+    post:
+      tags: [Listings]
+      summary: Create a listing (seller)
+      description: Creates a listing in `draft` or `active` status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ListingCreate' }
+      responses:
+        '201':
+          description: Listing created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Listing' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /listings/{listingId}:
+    parameters:
+      - $ref: '#/components/parameters/ListingId'
+    get:
+      tags: [Listings]
+      summary: Get listing details
+      description: |
+        Shows approximate location only. Exact address is never returned here;
+        the buyer gets it from `/orders/{orderId}/pickup` once the seller confirms.
+      security: []
+      responses:
+        '200':
+          description: Listing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Listing' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Listings]
+      summary: Update a listing (owner only, not while reserved)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ListingUpdate' }
+      responses:
+        '200':
+          description: Updated listing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Listing' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Listings]
+      summary: Withdraw a listing (owner only)
+      responses:
+        '204': { description: Withdrawn }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /listings/{listingId}/impact:
+    get:
+      tags: [Impact]
+      summary: Estimated impact of buying this item used instead of new
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/ListingId'
+      responses:
+        '200':
+          description: Impact estimate
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Impact' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /users/me/listings:
+    get:
+      tags: [Listings]
+      summary: My listings (any status)
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/ListingStatus' } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of my listings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ListingSummary' }
+                  nextCursor: { type: [string, 'null'] }
+
+  # ---------------- Uploads ----------------
+  /uploads/presign:
+    post:
+      tags: [Uploads]
+      summary: Get a presigned URL to upload a listing image
+      description: |
+        Client uploads the file directly to the returned `uploadUrl` with HTTP PUT
+        (S3 presigned URL in AWS, MinIO/local endpoint in dev), then passes `imageKey`
+        in `ListingCreate.imageKeys`. The API never proxies image bytes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contentType, sizeBytes]
+              properties:
+                contentType: { type: string, enum: [image/jpeg, image/png, image/webp] }
+                sizeBytes: { type: integer, maximum: 5242880 }
+      responses:
+        '200':
+          description: Upload target
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imageKey: { type: string, example: listings/01HX.../a1.webp }
+                  uploadUrl: { type: string, format: uri }
+                  expiresAt: { type: string, format: date-time }
+                  requiredHeaders:
+                    type: object
+                    additionalProperties: { type: string }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  # ---------------- Orders ----------------
+  /orders:
+    post:
+      tags: [Orders]
+      summary: Reserve / buy an item (buyer)
+      description: |
+        Atomically moves the listing from `active` to `reserved`. Fails with 409 if
+        someone else got there first. The order starts as `pending_seller_confirmation`.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [listingId, paymentMethod]
+              properties:
+                listingId: { type: string }
+                paymentMethod: { $ref: '#/components/schemas/PaymentMethod' }
+                note: { type: string, maxLength: 300 }
+      responses:
+        '201':
+          description: Order created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '403':
+          description: Buyer is the seller
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Orders]
+      summary: List my orders
+      parameters:
+        - name: role
+          in: query
+          schema: { type: string, enum: [buyer, seller], default: buyer }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/OrderStatus' } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of orders
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Order' }
+                  nextCursor: { type: [string, 'null'] }
+  /orders/{orderId}:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    get:
+      tags: [Orders]
+      summary: Get an order (buyer or seller of that order only)
+      responses:
+        '200':
+          description: Order
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /orders/{orderId}/confirm:
+    post:
+      tags: [Orders]
+      summary: Seller accepts the order and sets pickup details
+      description: |
+        Moves `pending_seller_confirmation` to `awaiting_payment`. The address and
+        window are stored but stay hidden from the buyer until payment succeeds.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PickupDetailsInput' }
+      responses:
+        '200':
+          description: Order confirmed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /orders/{orderId}/cancel:
+    post:
+      tags: [Orders]
+      summary: Cancel an order (buyer or seller)
+      description: |
+        Releases the listing back to `active`. Not allowed once `completed`. If the
+        order was already paid, the payment is refunded (`paymentStatus` becomes `refunded`).
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 300 }
+      responses:
+        '200':
+          description: Order cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /orders/{orderId}/complete:
+    post:
+      tags: [Orders]
+      summary: Seller marks handover done by entering the buyer's pickup code
+      description: |
+        Moves `confirmed` (paid) to `completed`, marks the listing `sold`, releases the
+        held payment to the seller's `upiId`, and credits the impact (CO2e and water
+        avoided) to both users and the platform totals.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pickupCode]
+              properties:
+                pickupCode: { type: string, pattern: '^[0-9]{6}$' }
+      responses:
+        '200':
+          description: Order completed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: Wrong pickup code
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------- Payment ----------------
+  /orders/{orderId}/payment:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    post:
+      tags: [Orders]
+      summary: Start the UPI payment (buyer, after the seller confirms)
+      description: |
+        Allowed only while the order is `awaiting_payment`. Returns a UPI intent link and
+        QR payload for the platform's collection account; funds are held until handover.
+        Calling again returns the existing open payment.
+      responses:
+        '201':
+          description: Payment created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Orders]
+      summary: Poll payment status
+      responses:
+        '200':
+          description: Current payment
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /payments/webhook:
+    post:
+      tags: [Orders]
+      summary: Payment provider callback (server-to-server)
+      description: |
+        Verified with the `X-Signature` header. On `succeeded` the payment becomes `paid`,
+        the order becomes `confirmed`, the pickup code is generated and the pickup details
+        become visible to the buyer. Idempotent per `paymentId`.
+      security: []
+      parameters:
+        - { name: X-Signature, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentId, status]
+              properties:
+                paymentId: { type: string }
+                status: { type: string, enum: [succeeded, failed] }
+                upiTransactionRef: { type: string }
+      responses:
+        '200': { description: Processed }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /payments/mock/{paymentId}/succeed:
+    post:
+      tags: [Orders]
+      summary: LOCAL ONLY - simulate a successful UPI payment
+      description: Disabled outside local mode. Runs the same logic as the webhook for demos.
+      security: []
+      parameters:
+        - { name: paymentId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Payment marked paid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- Pickup ----------------
+  /orders/{orderId}/pickup:
+    get:
+      tags: [Pickup]
+      summary: Get pickup details (only after UPI payment succeeds)
+      description: |
+        The only place the exact address, contact phone and pickup code are exposed.
+        Returns 409 while the order is `pending_seller_confirmation`, 402 while it is
+        `awaiting_payment` (or the payment is pending or failed), and 403 for anyone but
+        the order's buyer or seller (the code is withheld from the seller).
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Pickup details
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pickup' }
+        '402':
+          description: Payment not completed yet
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ---------------- Impact ----------------
+  /impact/me:
+    get:
+      tags: [Impact]
+      summary: My lifetime impact (as buyer and as seller)
+      responses:
+        '200':
+          description: Totals
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImpactTotals' }
+  /impact/platform:
+    get:
+      tags: [Impact]
+      summary: Platform-wide impact totals and city breakdown
+      security: []
+      parameters:
+        - { name: since, in: query, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: Platform totals
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ImpactTotals'
+                  - type: object
+                    properties:
+                      byCity:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            city: { type: string }
+                            itemsReused: { type: integer }
+                            co2eSavedKg: { type: number }
+                            waterSavedLitres: { type: number }
+
+  # ---------------- Reviews ----------------
+  /orders/{orderId}/reviews:
+    post:
+      tags: [Reviews]
+      summary: Review the other party after a completed order
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5 }
+                comment: { type: string, maxLength: 500 }
+      responses:
+        '201':
+          description: Review recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  rating: { type: integer }
+                  comment: { type: string }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    UserId: { name: userId, in: path, required: true, schema: { type: string } }
+    ListingId: { name: listingId, in: path, required: true, schema: { type: string } }
+    OrderId: { name: orderId, in: path, required: true, schema: { type: string } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+    Cursor: { name: cursor, in: query, schema: { type: string } }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: State conflict (e.g. item already reserved, invalid status transition)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Request body failed validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          examples: [validation_failed, item_unavailable, invalid_transition, forbidden, not_found]
+        message: { type: string }
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              issue: { type: string }
+
+    RegisterRequest:
+      type: object
+      required: [name, email, password]
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        password: { type: string, format: password, minLength: 8 }
+        phone: { type: string }
+        city: { type: string }
+    AuthResponse:
+      type: object
+      properties:
+        accessToken: { type: string }
+        expiresIn: { type: integer, description: Seconds }
+        user: { $ref: '#/components/schemas/User' }
+
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        city: { type: string }
+        area: { type: string, description: Neighbourhood shown publicly }
+        createdAt: { type: string, format: date-time }
+    UserUpdate:
+      type: object
+      properties:
+        name: { type: string }
+        phone: { type: string }
+        upiId:
+          type: string
+          example: name@bank
+          description: Seller payout UPI ID. Private; never returned in public profiles.
+        city: { type: string }
+        area: { type: string }
+    PublicUser:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        city: { type: string }
+        area: { type: string }
+        ratingAvg: { type: number }
+        ratingCount: { type: integer }
+        itemsSold: { type: integer }
+        co2eSavedKg: { type: number }
+        waterSavedLitres: { type: number }
+
+    Category:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string, examples: [Clothing, Footwear, Electronics, Furniture, Books] }
+        co2ePerItemKg:
+          type: number
+          description: Illustrative kg CO2e avoided by reusing one typical item vs buying new
+        waterPerItemLitres:
+          type: number
+          description: Illustrative litres of water avoided per typical item
+
+    Condition:
+      type: string
+      enum: [like_new, good, fair, needs_repair]
+    ListingStatus:
+      type: string
+      enum: [draft, active, reserved, sold, withdrawn]
+    PaymentMethod:
+      type: string
+      enum: [upi]
+      description: |
+        Payment is collected by the platform before pickup details are shared. Locally it
+        is simulated with `/payments/mock/{paymentId}/succeed`; in production a gateway
+        (e.g. Razorpay or Cashfree) confirms it through the webhook.
+    OrderStatus:
+      type: string
+      enum: [pending_seller_confirmation, awaiting_payment, confirmed, completed, cancelled, expired]
+      description: '`confirmed` means the seller accepted AND the buyer has paid.'
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount: { type: number, minimum: 0 }
+        currency: { type: string, default: INR }
+
+    ApproxLocation:
+      type: object
+      properties:
+        city: { type: string }
+        area: { type: string }
+        lat: { type: number, description: Rounded/jittered, about 500 m }
+        lng: { type: number }
+
+    ListingCreate:
+      type: object
+      required: [title, categoryId, condition, price, imageKeys, approxLocation]
+      properties:
+        title: { type: string, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+        categoryId: { type: string }
+        condition: { $ref: '#/components/schemas/Condition' }
+        price: { $ref: '#/components/schemas/Money' }
+        ageYears: { type: number, description: Approximate age of the item }
+        imageKeys:
+          type: array
+          minItems: 1
+          maxItems: 6
+          items: { type: string }
+        approxLocation: { $ref: '#/components/schemas/ApproxLocation' }
+        status:
+          type: string
+          enum: [draft, active]
+          default: active
+    ListingUpdate:
+      type: object
+      properties:
+        title: { type: string }
+        description: { type: string }
+        condition: { $ref: '#/components/schemas/Condition' }
+        price: { $ref: '#/components/schemas/Money' }
+        imageKeys: { type: array, items: { type: string } }
+        status: { type: string, enum: [draft, active] }
+    ListingSummary:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        price: { $ref: '#/components/schemas/Money' }
+        condition: { $ref: '#/components/schemas/Condition' }
+        categoryId: { type: string }
+        thumbnailUrl: { type: string, format: uri }
+        area: { type: string }
+        distanceKm: { type: number }
+        status: { $ref: '#/components/schemas/ListingStatus' }
+        co2eSavedKg: { type: number }
+        waterSavedLitres: { type: number }
+    Listing:
+      allOf:
+        - $ref: '#/components/schemas/ListingSummary'
+        - type: object
+          properties:
+            description: { type: string }
+            ageYears: { type: number }
+            imageUrls:
+              type: array
+              items: { type: string, format: uri }
+            approxLocation: { $ref: '#/components/schemas/ApproxLocation' }
+            seller: { $ref: '#/components/schemas/PublicUser' }
+            createdAt: { type: string, format: date-time }
+            updatedAt: { type: string, format: date-time }
+
+    Impact:
+      type: object
+      properties:
+        co2eSavedKg: { type: number }
+        waterSavedLitres: { type: number }
+        methodology:
+          type: string
+          description: Short text naming the per-category factor used
+          example: Category factor for Clothing (illustrative), scaled by condition.
+    ImpactTotals:
+      type: object
+      properties:
+        itemsReused: { type: integer }
+        co2eSavedKg: { type: number }
+        waterSavedLitres: { type: number }
+        asBuyer: { $ref: '#/components/schemas/Impact' }
+        asSeller: { $ref: '#/components/schemas/Impact' }
+
+    PickupDetailsInput:
+      type: object
+      required: [address, windowStart, windowEnd]
+      properties:
+        address:
+          type: object
+          required: [line1, city]
+          properties:
+            line1: { type: string }
+            line2: { type: string }
+            city: { type: string }
+            pincode: { type: string }
+            lat: { type: number }
+            lng: { type: number }
+        windowStart: { type: string, format: date-time }
+        windowEnd: { type: string, format: date-time }
+        instructions: { type: string, maxLength: 300 }
+        contactPhone: { type: string }
+    Pickup:
+      allOf:
+        - $ref: '#/components/schemas/PickupDetailsInput'
+        - type: object
+          properties:
+            orderId: { type: string }
+            pickupCode:
+              type: string
+              pattern: '^[0-9]{6}$'
+              description: Shown to the buyer only; seller enters it at handover.
+    Order:
+      type: object
+      properties:
+        id: { type: string }
+        listing: { $ref: '#/components/schemas/ListingSummary' }
+        buyerId: { type: string }
+        sellerId: { type: string }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        paymentMethod: { $ref: '#/components/schemas/PaymentMethod' }
+        paymentStatus: { type: string, enum: [unpaid, pending, paid, failed, refunded] }
+        price: { $ref: '#/components/schemas/Money' }
+        note: { type: string }
+        impact: { $ref: '#/components/schemas/Impact' }
+        createdAt: { type: string, format: date-time }
+        confirmedAt: { type: [string, 'null'], format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+        expiresAt:
+          type: string
+          format: date-time
+          description: Auto-expires (and releases the listing) if the seller does not confirm, or the buyer does not pay, in time.
+    Payment:
+      type: object
+      properties:
+        id: { type: string }
+        orderId: { type: string }
+        amount: { $ref: '#/components/schemas/Money' }
+        status: { type: string, enum: [pending, paid, failed, refunded] }
+        upiIntentUrl: { type: string, description: 'upi://pay?... deep link' }
+        qrPayload: { type: string }
+        upiTransactionRef: { type: [string, 'null'] }
+        createdAt: { type: string, format: date-time }
+        paidAt: { type: [string, 'null'], format: date-time }
